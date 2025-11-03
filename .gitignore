@@ -1,0 +1,26 @@
+Visual Studio generált fájlok, amiket sosem akarunk feltölteni.
+
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+
+A lefordított program mappái (A legfontosabbak!)
+
+A [Bb]in/ forma biztosítja, hogy a "bin" és a "Bin" mappát is figyelmen kívül hagyja.
+
+[Bb]in/
+[Oo]bj/
+[Rr]elease/
+[Dd]ebug/
+
+NuGet csomagok mappája
+
+packages/
+*.nupkg
+
+Egyéb log és rendszerfájlok
+
+*.log
+*.DS_Store
