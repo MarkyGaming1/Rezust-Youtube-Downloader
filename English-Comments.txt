@@ -1,0 +1,839 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq; // This 'using' is required for .ToListAsync()
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using System.IO;                 // For file operations (Path, File, Directory)
+using System.Diagnostics;        // For the Process class (running FFmpeg)
+using System.Text.RegularExpressions; // For Regex (filename sanitization)
+using System.Threading;          // OPTIMIZATION: Added for SemaphoreSlim
+using YoutubeExplode;            // The downloader itself
+using YoutubeExplode.Videos.Streams; // For StreamInfo
+
+
+namespace YoutubeMp3Downloader
+{
+    public partial class Form1 : Form
+    {
+        // NEW: We cache the current video's stream manifest so we don't have to fetch it twice
+        private StreamManifest _currentManifest = null;
+        private YoutubeClient _youtubeClient;
+        private bool _isPlaylist = false; // NEW: Flag to indicate if the link is a playlist
+
+        public Form1()
+        {
+            InitializeComponent();
+            _youtubeClient = new YoutubeClient(); // Initialize the client
+
+            // ==================================================================
+            // FIX (2025.11.03): Window settings
+            // ==================================================================
+            this.Text = "Rezust YouTube Downloader"; // Set the window title
+            this.FormBorderStyle = FormBorderStyle.FixedSingle; // Not resizable
+            this.MaximizeBox = false; // Disable maximize button
+            // ==================================================================
+
+
+            // Set default visibility on startup
+            qualityLabel.Visible = false;
+            qualityComboBox.Visible = false;
+            thumbnailPreviewBox.Visible = false; // NEW: Hide thumbnail
+
+            // ==================================================================
+            // FIX: The 'Items' (Collection) in the Designer MUST BE EMPTY!
+            // The code will populate it, avoiding duplicates.
+            // ==================================================================
+            formatComboBox.Items.Clear(); // Safety clear
+            formatComboBox.Items.AddRange(new string[] { "MP3", "MP4" });
+
+            // FIX: The 'Select' text is the Text property, not an 'Item'
+            formatComboBox.Text = "Select format...";
+
+            // ==================================================================
+            // FIX: Logic change - Format selector disabled without URL
+            // ==================================================================
+            formatComboBox.Enabled = false;
+            // Manually wire up the URL box's 'TextChanged' event
+            this.urlTextBox.TextChanged += new System.EventHandler(this.urlTextBox_TextChanged);
+        }
+
+        private void Form1_Load(object sender, EventArgs e)
+        {
+            // This is likely an unused event handler,
+            // (e.g., from an accidental double-click on the Form in the Designer)
+            // but Form1.Designer.cs references it. Can be left empty.
+        }
+
+        // FIX: This method is now in use (wired up in line 47)
+        // FIX (2025.11.03): Expanded to also reset the UI
+        private void urlTextBox_TextChanged(object sender, EventArgs e)
+        {
+            // 1. Only enable the format selector if there is text in the URL box
+            formatComboBox.Enabled = !string.IsNullOrWhiteSpace(urlTextBox.Text);
+
+            // 2. FIX: If the link changes, reset the format selection
+            // and hide the quality/thumbnail section to force a new scan.
+            formatComboBox.Text = "Select format...";
+            qualityLabel.Visible = false;
+            qualityComboBox.Visible = false;
+            thumbnailPreviewBox.Visible = false;
+            thumbnailPreviewBox.Image = null;
+
+            // 3. Also clear the cached data
+            _currentManifest = null;
+            _isPlaylist = false;
+        }
+
+        private void urlLabel_Click(object sender, EventArgs e) { }
+
+        // ==================================================================
+        // FIX: Added missing, Designer-generated event handlers
+        // to allow the project to compile.
+        // ==================================================================
+        private void textBox1_TextChanged(object sender, EventArgs e)
+        {
+            // This is likely an unused event handler,
+            // but Form1.Designer.cs references it. Can be left empty.
+        }
+
+        private void statusLabel_Click(object sender, EventArgs e)
+        {
+            // This is likely an unused event handler,
+            // (e.g., from an accidental double-click on the label in the Designer)
+            // but Form1.Designer.cs references it. Can be left empty.
+        }
+        // ==================================================================
+
+        private void browseButton_Click(object sender, EventArgs e)
+        {
+            using (var fbd = new FolderBrowserDialog())
+            {
+                fbd.SelectedPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+
+                if (fbd.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(fbd.SelectedPath))
+                {
+                    folderTextBox.Text = fbd.SelectedPath;
+                }
+            }
+        }
+
+
+        // ==================================================================
+        // NEW HELPER METHODS for locking and unlocking the UI
+        // ==================================================================
+
+        /// <summary>
+        /// Locks the main controls and indicates a "Loading" state.
+        /// </summary>
+        private void LockUI(string statusMessage)
+        {
+            this.Invoke((Action)(() => {
+                statusLabel.Text = statusMessage;
+                progressBar.Style = ProgressBarStyle.Marquee; // Infinite "scrolling" bar
+                downloadButton.Enabled = false;
+                browseButton.Enabled = false;
+                urlTextBox.Enabled = false;
+                formatComboBox.Enabled = false;
+                qualityComboBox.Enabled = false;
+                thumbnailPreviewBox.Visible = false; // NEW: Hide on lock
+            }));
+        }
+
+        /// <summary>
+        /// Unlocks the controls and resets to the default state.
+        /// </summary>
+        private void UnlockUI()
+        {
+            this.Invoke((Action)(() => {
+                statusLabel.Text = "Ready.";
+                progressBar.Style = ProgressBarStyle.Blocks; // Normal bar
+                progressBar.Value = 0;
+                downloadButton.Enabled = true;
+                browseButton.Enabled = true;
+                urlTextBox.Enabled = true;
+                formatComboBox.Enabled = true;
+                qualityComboBox.Enabled = true;
+            }));
+        }
+
+        // ==================================================================
+        // FIX (2025.11.04): New helper method to intelligently find the FFmpeg path
+        // ==================================================================
+        private string GetFfmpegPath()
+        {
+            // Path 1: The 'bin' subfolder (for the clean Release structure)
+            string releasePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "bin", "ffmpeg.exe");
+            if (File.Exists(releasePath))
+            {
+                return releasePath;
+            }
+
+            // Path 2: The main folder (for Debug mode)
+            string debugPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ffmpeg.exe");
+            if (File.Exists(debugPath))
+            {
+                return debugPath;
+            }
+
+            // If not found anywhere, return the default (debug) path,
+            // so the error message in ConvertToMp3Async shows the simplest path.
+            return debugPath;
+        }
+
+        // ==================================================================
+
+        // NEW METHOD: Loads only the "High, Medium, Low" fallback options
+        private void PopulateFallbackQualities()
+        {
+            qualityComboBox.Items.Clear();
+            qualityComboBox.Items.AddRange(new string[] { "High", "Medium", "Low" });
+            qualityComboBox.SelectedIndex = 0;
+        }
+
+        // ==================================================================
+        // NEW MENU FUNCTIONS (Based on your request)
+        // ==================================================================
+
+        // This is the method name VS Designer generates by default for the "How to Use" button
+        private void howToUseToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            // FIX: The Help text goes here
+            string helpTitle = "How to Use";
+            string helpMessage =
+                "1. Paste a YouTube Video or Playlist URL into the 'URL' box.\n\n" +
+                "2. Select a format (MP3 or MP4). The program will then scan for available qualities.\n\n" +
+                "3. Select your desired quality from the 'Quality' dropdown.\n\n" +
+                "4. Click 'Browse' to choose a folder to save your file(s).\n\n" +
+                "5. Click 'Start Download'.\n\n" +
+                "Note: MP3 conversion and high-quality MP4 (720p+) merging both require 'ffmpeg.exe' to be in the same folder as this program.";
+
+            MessageBox.Show(helpMessage, helpTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        // This is the method name VS Designer generates by default for the "Open Download Location" button
+        private void openDownloadLocationToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            // FIX: The logic for opening the folder goes here
+            string path = folderTextBox.Text;
+
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                MessageBox.Show("No download folder has been selected yet.", "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (Directory.Exists(path))
+            {
+                // Opens the folder in Windows Explorer
+                Process.Start("explorer.exe", path);
+            }
+            else
+            {
+                MessageBox.Show("The selected folder does not exist or has been moved.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // ==================================================================
+
+
+        // THIS IS THE OPTIMIZED DOWNLOAD METHOD
+        private async void downloadButton_Click(object sender, EventArgs e)
+        {
+            // Step 1: Read the data from the GUI
+            string inputUrl = urlTextBox.Text;
+            string downloadFolder = folderTextBox.Text;
+            string selectedFormat = formatComboBox.SelectedItem?.ToString();
+            string selectedQuality = qualityComboBox.SelectedItem?.ToString();
+
+
+            // Step 2: Validation
+            if (string.IsNullOrWhiteSpace(inputUrl) ||
+                string.IsNullOrWhiteSpace(downloadFolder) ||
+                string.IsNullOrWhiteSpace(selectedFormat) ||
+                string.IsNullOrWhiteSpace(selectedQuality))
+            {
+                MessageBox.Show("All fields must be filled (URL, Folder, Format, Quality)!", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            // FIX: Check if a valid format is selected,
+            // and not just the "Select format..." placeholder text
+            if (selectedFormat != "MP3" && selectedFormat != "MP4")
+            {
+                MessageBox.Show("Please select a valid format (MP3 or MP4).", "Invalid Format", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // Step 3: Disable UI
+            LockUI("Preparing download...");
+
+            try
+            {
+                // Step 4: Initialize YoutubeExplode
+                var videosToDownload = new List<YoutubeExplode.Videos.IVideo>();
+
+                // URL validation and video collection happens here
+                var playlistId = YoutubeExplode.Playlists.PlaylistId.TryParse(inputUrl);
+                var videoId = YoutubeExplode.Videos.VideoId.TryParse(inputUrl);
+
+                if (playlistId != null)
+                {
+                    this.Invoke((Action)(() => statusLabel.Text = "Fetching playlist data..."));
+                    // FIX: Replaced C# 7.3 compatible "await foreach" with C# 7.0 compatible GetAsyncEnumerator
+                    var enumerator = _youtubeClient.Playlists.GetVideosAsync(playlistId.Value).GetAsyncEnumerator();
+                    try
+                    {
+                        while (await enumerator.MoveNextAsync())
+                        {
+                            videosToDownload.Add(enumerator.Current);
+                        }
+                    }
+                    finally
+                    {
+                        await enumerator.DisposeAsync();
+                    }
+                }
+                else if (videoId != null)
+                {
+                    this.Invoke((Action)(() => statusLabel.Text = "Fetching video data..."));
+                    var video = await _youtubeClient.Videos.GetAsync(videoId.Value);
+                    videosToDownload.Add(video);
+                }
+                else
+                {
+                    statusLabel.Text = "Error: Invalid YouTube URL.";
+                    MessageBox.Show("The provided URL is not a valid YouTube video or playlist.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    UnlockUI();
+                    return;
+                }
+
+                this.Invoke((Action)(() => progressBar.Maximum = videosToDownload.Count));
+                int completedCount = 0;
+
+                if (videosToDownload.Count == 0)
+                {
+                    statusLabel.Text = "No video found.";
+                    UnlockUI();
+                    return;
+                }
+
+                // Step 5: Set up parallelism
+                const int MAX_PARALLEL_TASKS = 4;
+                var semaphore = new SemaphoreSlim(MAX_PARALLEL_TASKS);
+
+                var tasks = new List<Task>();
+                this.Invoke((Action)(() => {
+                    statusLabel.Text = "Preparing downloads...";
+                    progressBar.Style = ProgressBarStyle.Blocks;
+                }));
+
+
+                // Step 6: Create Tasks
+                foreach (var video in videosToDownload)
+                {
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        await semaphore.WaitAsync();
+                        try
+                        {
+                            string safeTitle = SanitizeFileName(video.Title);
+
+                            this.Invoke((Action)(() => {
+                                statusLabel.Text = $"Processing: {safeTitle}";
+                            }));
+
+                            // Decide based on format
+                            if (selectedFormat == "MP3")
+                            {
+                                await DownloadAsMp3Async(_youtubeClient, video, downloadFolder, safeTitle, selectedQuality);
+                            }
+                            else // "MP4"
+                            {
+                                await DownloadAsMp4Async(_youtubeClient, video, downloadFolder, safeTitle, selectedQuality);
+                            }
+
+                            int currentCount = Interlocked.Increment(ref completedCount);
+
+                            this.Invoke((Action)(() => {
+                                progressBar.Value = currentCount;
+                                statusLabel.Text = $"({currentCount}/{videosToDownload.Count}) Done: {safeTitle}";
+                            }));
+                        }
+                        // ==================================================================
+                        // FIX (2025.11.04): We no longer "swallow" the error with Debug.WriteLine,
+                        // but instead notify the user with a popup MessageBox!
+                        // ==================================================================
+                        catch (Exception ex)
+                        {
+                            // We must switch from the background thread (Task.Run) to the UI thread (Invoke) for the MessageBox
+                            this.Invoke((Action)(() => {
+                                MessageBox.Show($"Error processing '{video.Title}':\n\n{ex.Message}", "Download Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            }));
+
+                            // We still update the progress bar to indicate
+                            // the program has moved on to the next video.
+                            int currentCount = Interlocked.Increment(ref completedCount);
+                            this.Invoke((Action)(() => {
+                                progressBar.Value = currentCount;
+                            }));
+                        }
+                        finally
+                        {
+                            semaphore.Release();
+                        }
+                    }));
+                }
+
+                // Step 7: Wait for ALL tasks to complete
+                await Task.WhenAll(tasks);
+
+                statusLabel.Text = "Download complete!";
+                MessageBox.Show("Done!", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = "An error occurred.";
+                MessageBox.Show($"Error: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                // Step 8: Re-enable UI
+                UnlockUI();
+            }
+        }
+
+        // ==================================================================
+        // FIXED: This is now the main "trigger" method.
+        // The URL scanning logic was moved here.
+        // ==================================================================
+        private async void formatComboBox_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            string selectedFormat = formatComboBox.SelectedItem?.ToString();
+
+            // ==================================================================
+            // FIX: "Safety guard"
+            // If the selected item isn't "MP3" or "MP4" (e.g., it's still the "Select..." placeholder),
+            // do nothing.
+            // ==================================================================
+            if (selectedFormat != "MP3" && selectedFormat != "MP4")
+            {
+                return; // Don't start the scan
+            }
+
+            // FIX: Lock the UI during scanning and refreshing
+            LockUI("Checking URL and fetching qualities...");
+
+            try
+            {
+                // STEP 1: URL Scan (moved here)
+                string url = urlTextBox.Text;
+                var videoId = YoutubeExplode.Videos.VideoId.TryParse(url);
+                var playlistId = YoutubeExplode.Playlists.PlaylistId.TryParse(url);
+
+                // Default state: hide everything and clear the cache
+                qualityLabel.Visible = false;
+                qualityComboBox.Visible = false;
+                qualityComboBox.Items.Clear();
+                thumbnailPreviewBox.Visible = false; // NEW: Hide thumbnail during scan
+                thumbnailPreviewBox.Image = null; // NEW: Clear image
+                _currentManifest = null;
+                _isPlaylist = false;
+
+                if (playlistId != null)
+                {
+                    _isPlaylist = true;
+                    qualityLabel.Text = "Quality:";
+                }
+                else if (videoId != null)
+                {
+                    _isPlaylist = false;
+                    qualityLabel.Text = "Quality:";
+                    try
+                    {
+                        // NEW: First, get the video metadata (for the thumbnail)
+                        var video = await _youtubeClient.Videos.GetAsync(videoId.Value);
+
+                        // ==================================================================
+                        // FIX: The 'GetWithHighestResolution()' method doesn't exist.
+                        // Instead, we sort the list by resolution (Area) with LINQ and select the first one.
+                        // ==================================================================
+                        var thumbnailUrl = video.Thumbnails.OrderByDescending(t => t.Resolution.Area).FirstOrDefault()?.Url; // This loads the image
+
+                        thumbnailPreviewBox.ImageLocation = thumbnailUrl; // This loads the image
+
+                        // After this, we get the streams (as before)
+                        _currentManifest = await _youtubeClient.Videos.Streams.GetManifestAsync(videoId.Value);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Manifest error: {ex.Message}");
+
+                        // ==================================================================
+                        // FIX: Don't fail silently! Inform the user.
+                        // ==================================================================
+                        MessageBox.Show($"Failed to fetch video details: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        return; // On error, exit (the finally block will unlock the UI)
+                    }
+                }
+                else
+                {
+                    // ==================================================================
+                    // FIX: Don't fail silently if the URL is invalid
+                    // (but only if the field isn't empty)
+                    // ==================================================================
+                    if (!string.IsNullOrWhiteSpace(url))
+                    {
+                        MessageBox.Show("The URL is not a valid YouTube video or playlist link.", "Invalid URL", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                    return; // Invalid URL (the finally block will unlock the UI)
+                }
+
+                // STEP 2: Populate quality list (the old logic)
+                // string selectedFormat = formatComboBox.SelectedItem?.ToString(); // Already have this from above
+
+                if (_isPlaylist)
+                {
+                    // Playlist: Always "High, Medium, Low"
+                    PopulateFallbackQualities();
+                }
+                else if (_currentManifest != null)
+                {
+                    // Single video: Populate dynamically
+                    if (selectedFormat == "MP3")
+                    {
+                        var audioStreams = _currentManifest.GetAudioOnlyStreams()
+                            .OrderByDescending(s => s.Bitrate)
+                            .ToList();
+
+                        if (audioStreams.Count > 0)
+                        {
+                            foreach (var s in audioStreams)
+                            {
+                                // FIX: Rounding to avoid decimals
+                                string bitrateLabel = $"~{Math.Round(s.Bitrate.KiloBitsPerSecond)} kbps";
+                                if (!qualityComboBox.Items.Contains(bitrateLabel))
+                                {
+                                    qualityComboBox.Items.Add(bitrateLabel);
+                                }
+                            }
+                        }
+                    }
+                    else if (selectedFormat == "MP4")
+                    {
+                        // ==================================================================
+                        // FIX (360p Bug): We now use GetVideoOnlyStreams()
+                        // to show qualities above 720p.
+                        // ==================================================================
+                        var videoStreams = _currentManifest.GetVideoOnlyStreams() // <-- THIS CHANGED
+                            .Where(s => s.Container.Name == "mp4" || s.Container.Name == "webm")
+                            .OrderByDescending(s => s.VideoQuality)
+                            .ToList();
+
+                        if (videoStreams.Count > 0)
+                        {
+                            foreach (var s in videoStreams)
+                            {
+                                string qualityLabel = s.VideoQuality.Label; // e.g., "1080p"
+                                if (!qualityComboBox.Items.Contains(qualityLabel))
+                                {
+                                    qualityComboBox.Items.Add(qualityLabel);
+                                }
+                            }
+                        }
+                    }
+
+                    if (qualityComboBox.Items.Count == 0)
+                    {
+                        PopulateFallbackQualities();
+                    }
+                }
+                else
+                {
+                    PopulateFallbackQualities();
+                }
+
+                // STEP 3: Make UI visible
+                qualityLabel.Visible = true;
+                qualityComboBox.Visible = true;
+                if (!_isPlaylist) // NEW: Only show the image if it's a single video
+                {
+                    thumbnailPreviewBox.Visible = true;
+                }
+                if (qualityComboBox.Items.Count > 0)
+                    qualityComboBox.SelectedIndex = 0; // Select the best one
+            }
+            finally
+            {
+                // FIX: Always unlock the UI
+                UnlockUI();
+            }
+        }
+
+
+        private string SanitizeFileName(string fileName)
+        {
+            string invalidChars = new string(Path.GetInvalidFileNameChars());
+            string pattern = $"[{Regex.Escape(invalidChars)}]";
+            return Regex.Replace(fileName, pattern, "_");
+        }
+
+        // ==================================================================
+        // FIX (360p Bug): This method has been completely rewritten.
+        // It now downloads video and audio separately, then
+        // muxes them with FFmpeg.
+        // ==================================================================
+        private async Task DownloadAsMp4Async(YoutubeClient youtube, YoutubeExplode.Videos.IVideo video, string downloadFolder, string safeTitle, string selectedQuality)
+        {
+            var manifest = _currentManifest ?? await youtube.Videos.Streams.GetManifestAsync(video.Id);
+
+            // 1. Select the best AUDIO stream (always needed)
+            var audioStreamInfo = manifest.GetAudioOnlyStreams().GetWithHighestBitrate();
+            if (audioStreamInfo == null)
+            {
+                throw new Exception($"No audio stream found for this video: {safeTitle}");
+            }
+
+            // 2. Select the requested VIDEO stream (from VideoOnly streams)
+            var videoStreams = manifest.GetVideoOnlyStreams()
+                .OrderByDescending(s => s.VideoQuality)
+                .ToList();
+
+            if (videoStreams.Count == 0)
+            {
+                throw new Exception($"No video-only stream found for this video: {safeTitle}");
+            }
+
+            // FIX: Changed to IVideoStreamInfo so .VideoQuality is available
+            IVideoStreamInfo videoStreamInfo;
+            switch (selectedQuality)
+            {
+                case "High":
+                    videoStreamInfo = videoStreams.First();
+                    break;
+                case "Medium":
+                    videoStreamInfo = videoStreams[videoStreams.Count / 2];
+                    break;
+                case "Low":
+                    videoStreamInfo = videoStreams.Last();
+                    break;
+                default:
+                    videoStreamInfo = videoStreams.FirstOrDefault(s => s.VideoQuality.Label == selectedQuality);
+                    if (videoStreamInfo == null)
+                    {
+                        videoStreamInfo = videoStreams.First();
+                        Debug.WriteLine($"Warning: Requested MP4 quality ({selectedQuality}) not found. Downloading 'High'.");
+                    }
+                    break;
+            }
+
+            // 3. Define temporary files and output file
+            string tempVideoFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.{videoStreamInfo.Container.Name}");
+            string tempAudioFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.{audioStreamInfo.Container.Name}");
+            // The output will always be .mp4, regardless of the downloaded container
+            string outputFile = Path.Combine(downloadFolder, $"{safeTitle} [{videoStreamInfo.VideoQuality.Label}].mp4");
+
+            try
+            {
+                // 4. Download in parallel
+                // FIX: .DownloadAsync() returns a ValueTask.
+                // Task.WhenAll() needs a Task, so we use .AsTask().
+                var downloadVideoTask = youtube.Videos.Streams.DownloadAsync(videoStreamInfo, tempVideoFile).AsTask();
+                var downloadAudioTask = youtube.Videos.Streams.DownloadAsync(audioStreamInfo, tempAudioFile).AsTask();
+                await Task.WhenAll(downloadVideoTask, downloadAudioTask);
+
+                // 5. Muxing with FFmpeg
+                // FIX (OPUS Bug): Pass the audio stream info to the muxer
+                await MuxVideoAndAudioAsync(tempVideoFile, tempAudioFile, outputFile, audioStreamInfo);
+            }
+            finally
+            {
+                // 6. Delete temporary files (even if there was an error)
+                if (File.Exists(tempVideoFile)) File.Delete(tempVideoFile);
+                if (File.Exists(tempAudioFile)) File.Delete(tempAudioFile);
+            }
+        }
+
+        private async Task DownloadAsMp3Async(YoutubeClient youtube, YoutubeExplode.Videos.IVideo video, string downloadFolder, string safeTitle, string selectedQuality)
+        {
+            var manifest = _currentManifest ?? await youtube.Videos.Streams.GetManifestAsync(video.Id);
+
+            var audioStreams = manifest.GetAudioOnlyStreams()
+                .OrderByDescending(s => s.Bitrate)
+                .ToList();
+
+            if (audioStreams.Count == 0)
+            {
+                 throw new Exception($"No downloadable audio stream found for this video: {safeTitle}");
+            }
+
+            // FIX: Changed to IAudioStreamInfo
+            IAudioStreamInfo streamInfo;
+            switch (selectedQuality)
+            {
+                case "High":
+                    streamInfo = audioStreams.First();
+                    break;
+                case "Medium":
+                    streamInfo = audioStreams[audioStreams.Count / 2];
+                    break;
+                case "Low":
+                    streamInfo = audioStreams.Last();
+                    break;
+                default:
+                    streamInfo = audioStreams.FirstOrDefault(s => $"~{Math.Round(s.Bitrate.KiloBitsPerSecond)} kbps" == selectedQuality);
+                     if (streamInfo == null)
+                    {
+                        streamInfo = audioStreams.First();
+                        Debug.WriteLine($"Warning: Requested audio quality ({selectedQuality}) not found. Downloading 'High'.");
+                    }
+                    break;
+            }
+
+            string tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.{streamInfo.Container.Name}");
+            await youtube.Videos.Streams.DownloadAsync(streamInfo, tempFile);
+
+            // FIX: The rounded value also goes into the filename
+            string outputFile = Path.Combine(downloadFolder, $"{safeTitle} [~{Math.Round(streamInfo.Bitrate.KiloBitsPerSecond)}kbps].mp3");
+
+            await ConvertToMp3Async(tempFile, outputFile);
+            File.Delete(tempFile);
+        }
+
+        private Task ConvertToMp3Async(string inputFile, string outputFile)
+        {
+            // FIX (2025.11.04): Using the new, smarter GetFfmpegPath() method
+            string ffmpegPath = GetFfmpegPath();
+            if (!File.Exists(ffmpegPath))
+            {
+                // FIX: More specific error message
+                throw new FileNotFoundException(
+                    "'ffmpeg.exe' was not found in the application directory or '/bin' sub-directory!" +
+                    "It is required for MP3 conversion. Please download it and copy it to: " +
+                    AppDomain.CurrentDomain.BaseDirectory);
+            }
+
+            var processStartInfo = new ProcessStartInfo
+            {
+                FileName = ffmpegPath,
+                Arguments = $"-i \"{inputFile}\" -q:a 0 \"{outputFile}\" -y",
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true, 
+            };
+
+            var tcs = new TaskCompletionSource<bool>();
+            var process = new Process
+            {
+                StartInfo = processStartInfo,
+                EnableRaisingEvents = true
+            };
+
+            process.Exited += (sender, args) =>
+            {
+                if (process.ExitCode == 0)
+                {
+                    tcs.SetResult(true);
+                }
+                else
+                {
+                    string error = process.StandardError.ReadToEnd();
+                    tcs.SetException(new Exception($"FFmpeg error: {error}"));
+                }
+                process.Dispose();
+            };
+
+            try
+            {
+                process.Start();
+            }
+            catch (Exception ex)
+            {
+                tcs.SetException(ex);
+            }
+            
+            return tcs.Task;
+        }
+
+        // ==================================================================
+        // NEW HELPER METHOD (For 360p Bug Fix)
+        // This muxes (combines) the separate video and audio files using FFmpeg.
+        // ==================================================================
+        private Task MuxVideoAndAudioAsync(string videoFile, string audioFile, string outputFile, IAudioStreamInfo audioStreamInfo)
+        {
+            // FIX (2025.11.04): Using the new, smarter GetFfmpegPath() method
+            string ffmpegPath = GetFfmpegPath();
+            if (!File.Exists(ffmpegPath))
+            {
+                // FIX: More specific error message
+                throw new FileNotFoundException(
+                    "'ffmpeg.exe' was not found in the application directory or '/bin' sub-directory!" +
+                    "It is required for high-quality MP4 merging. Please download it and copy it to: " +
+                    AppDomain.CurrentDomain.BaseDirectory);
+            }
+
+            // ==================================================================
+            // FIX (OPUS Bug): We make the 'Arguments' string "smarter".
+            // ==================================================================
+            // Check if the audio stream is AAC. If yes, copy (fast).
+            // If not (e.g., OPUS), re-encode to AAC (slower, but compatible).
+            string audioCodec = audioStreamInfo.Container.Name == "m4a" ? "copy" : "aac";
+
+            var processStartInfo = new ProcessStartInfo
+            {
+                FileName = ffmpegPath,
+                // Arguments: 
+                // -i [videofile] -i [audiofile]
+                // -c:v copy (Video is always copied)
+                // -c:a [audioCodec] (Audio is encoded or copied)
+                // [outputfile] -y (overwrite)
+                Arguments = $"-i \"{videoFile}\" -i \"{audioFile}\" -c:v copy -c:a {audioCodec} \"{outputFile}\" -y",
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+
+            var tcs = new TaskCompletionSource<bool>();
+            var process = new Process
+            {
+                StartInfo = processStartInfo,
+                EnableRaisingEvents = true
+            };
+
+            process.Exited += (sender, args) =>
+            {
+                if (process.ExitCode == 0)
+                {
+                    tcs.SetResult(true);
+                }
+                else
+                {
+                    string error = process.StandardError.ReadToEnd();
+                    tcs.SetException(new Exception($"FFmpeg muxing error: {error}"));
+                }
+                process.Dispose();
+            };
+
+            try
+            {
+                process.Start();
+            }
+            catch (Exception ex)
+            {
+                tcs.SetException(ex);
+            }
+
+            return tcs.Task;
+        }
+
+        private void label2_Click(object sender, EventArgs e)
+        {
+            // This is likely an unused event handler,
+            // but Form1.Designer.cs references it. Can be left empty.
+        }
+    } // End of Form1 class
+} // End of namespace
+
